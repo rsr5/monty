@@ -234,6 +234,48 @@ async def main():
 }
 
 #[test]
+fn repl_start_runtime_error_preserves_repl_state() {
+    // Simulate an agent loop: create variables, then a later snippet raises.
+    // The REPL must survive so subsequent snippets can access prior variables.
+    let (repl, _) = init_repl("x = 10", vec![]);
+
+    // Snippet that sets a new variable then raises — returned via ReplProgress::Error.
+    let progress = repl
+        .start("y = 20\nraise ValueError('boom')", &mut PrintWriter::Stdout)
+        .unwrap();
+    let (mut repl, error) = progress.into_error().expect("expected ReplProgress::Error");
+    assert_eq!(error.exc_type(), monty::ExcType::ValueError);
+    assert_eq!(error.message(), Some("boom"));
+
+    // Variables from BEFORE the error snippet survive.
+    assert_eq!(repl.feed_no_print("x").unwrap(), MontyObject::Int(10));
+    // Variable assigned BEFORE the raise within the erroring snippet also survives.
+    assert_eq!(repl.feed_no_print("y").unwrap(), MontyObject::Int(20));
+    // New snippets continue to work normally.
+    assert_eq!(repl.feed_no_print("x + y + 12").unwrap(), MontyObject::Int(42));
+}
+
+#[test]
+fn repl_start_runtime_error_during_external_call_preserves_repl_state() {
+    // An external function returns an error, which should come back as ReplProgress::Error
+    // with the REPL session preserved.
+    let (repl, _) = init_repl("z = 99", vec!["ext_fn".to_owned()]);
+
+    let progress = repl.start("ext_fn(1)", &mut PrintWriter::Stdout).unwrap();
+    let (_function_name, _args, _kwargs, _call_id, _, state) =
+        progress.into_function_call().expect("expected function call");
+
+    // Resume with an exception from the external function.
+    let exc = monty::MontyException::new(monty::ExcType::RuntimeError, Some("ext failed".to_string()));
+    let progress = state.run(ExternalResult::Error(exc), &mut PrintWriter::Stdout).unwrap();
+    let (mut repl, error) = progress.into_error().expect("expected ReplProgress::Error");
+    assert_eq!(error.exc_type(), monty::ExcType::RuntimeError);
+
+    // Variable from before the error is still accessible.
+    assert_eq!(repl.feed_no_print("z").unwrap(), MontyObject::Int(99));
+}
+
+#[test]
 fn repl_dataclass_method_call_yields_function_call_with_method_flag() {
     // Create a REPL with a dataclass input and call a method on it.
     // This exercises the MethodCall path in repl.rs handle_repl_vm_result.
