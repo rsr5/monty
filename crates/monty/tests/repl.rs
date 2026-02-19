@@ -5,7 +5,7 @@
 
 use monty::{
     ExternalResult, MontyObject, MontyRepl, NoLimitTracker, PrintWriter, ReplContinuationMode, ReplProgress,
-    detect_repl_continuation_mode,
+    ReplStartError, detect_repl_continuation_mode,
 };
 
 fn init_repl(code: &str, external_functions: Vec<String>) -> (MontyRepl<NoLimitTracker>, MontyObject) {
@@ -239,11 +239,11 @@ fn repl_start_runtime_error_preserves_repl_state() {
     // The REPL must survive so subsequent snippets can access prior variables.
     let (repl, _) = init_repl("x = 10", vec![]);
 
-    // Snippet that sets a new variable then raises — returned via ReplProgress::Error.
-    let progress = repl
+    // Snippet that sets a new variable then raises — returned via ReplStartError.
+    let err = repl
         .start("y = 20\nraise ValueError('boom')", &mut PrintWriter::Stdout)
-        .unwrap();
-    let (mut repl, error) = progress.into_error().expect("expected ReplProgress::Error");
+        .expect_err("expected ReplStartError");
+    let ReplStartError { mut repl, error } = *err;
     assert_eq!(error.exc_type(), monty::ExcType::ValueError);
     assert_eq!(error.message(), Some("boom"));
 
@@ -257,7 +257,7 @@ fn repl_start_runtime_error_preserves_repl_state() {
 
 #[test]
 fn repl_start_runtime_error_during_external_call_preserves_repl_state() {
-    // An external function returns an error, which should come back as ReplProgress::Error
+    // An external function returns an error, which should come back as ReplStartError
     // with the REPL session preserved.
     let (repl, _) = init_repl("z = 99", vec!["ext_fn".to_owned()]);
 
@@ -267,8 +267,10 @@ fn repl_start_runtime_error_during_external_call_preserves_repl_state() {
 
     // Resume with an exception from the external function.
     let exc = monty::MontyException::new(monty::ExcType::RuntimeError, Some("ext failed".to_string()));
-    let progress = state.run(ExternalResult::Error(exc), &mut PrintWriter::Stdout).unwrap();
-    let (mut repl, error) = progress.into_error().expect("expected ReplProgress::Error");
+    let err = state
+        .run(ExternalResult::Error(exc), &mut PrintWriter::Stdout)
+        .expect_err("expected ReplStartError");
+    let ReplStartError { mut repl, error } = *err;
     assert_eq!(error.exc_type(), monty::ExcType::RuntimeError);
 
     // Variable from before the error is still accessible.
