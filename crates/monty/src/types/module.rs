@@ -2,10 +2,10 @@
 
 use crate::{
     args::ArgValues,
+    bytecode::VM,
     exception_private::{ExcType, RunResult},
     heap::{Heap, HeapGuard, HeapId},
     intern::{Interns, StringId},
-    io::PrintWriter,
     resource::ResourceTracker,
     types::{AttrCallResult, Dict, PyTrait},
     value::{EitherStr, Value},
@@ -129,12 +129,12 @@ impl Module {
     pub fn py_call_attr_raw(
         &self,
         _self_id: HeapId,
-        heap: &mut Heap<impl ResourceTracker>,
+        vm: &mut VM<'_, '_, impl ResourceTracker>,
         attr: &EitherStr,
         args: ArgValues,
-        interns: &Interns,
-        _print_writer: &mut PrintWriter<'_>,
     ) -> RunResult<AttrCallResult> {
+        let heap = &mut *vm.heap;
+        let interns = vm.interns;
         let mut args_guard = HeapGuard::new(args, heap);
 
         let attr_key = match attr {
@@ -157,7 +157,7 @@ impl Module {
             }
             None => Err(ExcType::attribute_error_module(
                 interns.get_str(self.name),
-                attr.as_str(interns),
+                attr.as_str(vm.interns),
             )),
         }
     }

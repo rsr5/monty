@@ -9,6 +9,7 @@ use crate::{
     args::{ArgValues, KwargsValues},
     asyncio::Coroutine,
     builtins::{Builtins, BuiltinsFunctions},
+    bytecode::FrameExit,
     defer_drop,
     exception_private::{ExcType, RunError},
     heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId},
@@ -47,6 +48,11 @@ pub(super) enum CallResult {
     /// of `ExtFunctionId` because method names are only known at runtime when dataclass
     /// inputs are provided.
     MethodCall(EitherStr, ArgValues),
+    /// The call returned a value that should be implicitly awaited.
+    ///
+    /// Used by `asyncio.run()` to execute a coroutine without an explicit `await`.
+    /// The VM will push the value onto the stack and execute `exec_get_awaitable`.
+    AwaitValue(Value),
 }
 
 impl From<AttrCallResult> for CallResult {
@@ -56,6 +62,7 @@ impl From<AttrCallResult> for CallResult {
             AttrCallResult::OsCall(func, args) => Self::OsCall(func, args),
             AttrCallResult::ExternalCall(ext_id, args) => Self::External(ext_id, args),
             AttrCallResult::MethodCall(name, args) => Self::MethodCall(name, args),
+            AttrCallResult::AwaitValue(v) => Self::AwaitValue(v),
         }
     }
 }
@@ -75,7 +82,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     pub(super) fn exec_call_function(&mut self, arg_count: usize) -> Result<CallResult, RunError> {
         let args = self.pop_n_args(arg_count);
         let callable = self.pop();
-        self.call_function(callable, args)
+        let this = self;
+        defer_drop!(callable, this);
+        this.call_function(callable, args)
     }
 
     /// Executes `CallBuiltinFunction` opcode.
@@ -86,7 +95,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         // Convert u8 to BuiltinsFunctions via FromRepr
         if let Some(builtin) = BuiltinsFunctions::from_repr(builtin_id) {
             let args = self.pop_n_args(arg_count);
-            builtin.call(self.heap, args, self.interns, self.print_writer)
+            builtin.call(self, args)
         } else {
             Err(RunError::internal("CallBuiltinFunction: invalid builtin_id"))
         }
@@ -125,6 +134,8 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         // Pop the callable
         let callable = self.pop();
+        let this = self;
+        defer_drop!(callable, this);
 
         // Build kwargs as Vec<(StringId, Value)>
         let kwargs_inline: Vec<(StringId, Value)> = kwname_ids.into_iter().zip(kw_values).collect();
@@ -141,7 +152,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             }
         };
 
-        self.call_function(callable, args)
+        this.call_function(callable, args)
     }
 
     /// Executes `CallAttr` opcode.
@@ -269,9 +280,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         match obj {
             Value::Ref(heap_id) => {
                 defer_drop!(obj, this);
-                let result = this
-                    .heap
-                    .call_attr_raw(heap_id, &attr, args, this.interns, this.print_writer);
+                let result = Heap::call_attr_raw(this, heap_id, &attr, args);
                 result.map(Into::into)
             }
             Value::InternString(string_id) => {
@@ -297,6 +306,55 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         }
     }
 
+    /// Evaluates a function in a position that doesn't yet support suspending.
+    ///
+    /// Calls the function and, if it's a user-defined function that pushes a frame,
+    /// runs the VM until that frame returns.
+    ///
+    /// Returns an error for external/OS functions since those require the host to
+    /// execute them and resume, which this synchronous context cannot support.
+    pub(crate) fn evaluate_function(
+        &mut self,
+        ctx: &'static str,
+        callable: &Value,
+        args: ArgValues,
+    ) -> Result<Value, RunError> {
+        match self.call_function(callable, args)? {
+            CallResult::Push(v) => Ok(v),
+            CallResult::FramePushed => {
+                // A new frame was pushed for a defined function call - we need to run it
+                // to completion.
+                let stack_depth = self.frames.len();
+                // Mark the frame as an exit point from the `run()` loop
+                self.current_frame_mut().should_return = true;
+                match self.run()? {
+                    FrameExit::Return(v) => Ok(v),
+                    FrameExit::ResolveFutures(_)
+                    | FrameExit::ExternalCall { .. }
+                    | FrameExit::OsCall { .. }
+                    | FrameExit::MethodCall { .. } => {
+                        // Pop frames off the stack from this failed evaluation
+                        while self.frames.len() > stack_depth {
+                            self.pop_frame();
+                        }
+                        Err(RunError::internal(format!(
+                            "{ctx}: external functions are not yet supported in this context"
+                        )))
+                    }
+                }
+            }
+            CallResult::External(_, _)
+            | CallResult::OsCall(_, _)
+            | CallResult::MethodCall(_, _)
+            | CallResult::AwaitValue(_) => {
+                // External calls are not supported in this context since the caller doesn't support suspending
+                Err(RunError::internal(format!(
+                    "{ctx}: external functions are not yet supported in this context"
+                )))
+            }
+        }
+    }
+
     /// Calls a callable value with the given arguments.
     ///
     /// Dispatches based on the callable type:
@@ -305,10 +363,10 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// - `Value::ExtFunction`: returns `External` for caller to execute
     /// - `Value::DefFunction`: pushes a new frame, returns `FramePushed`
     /// - `Value::Ref`: checks for closure/function on heap
-    fn call_function(&mut self, callable: Value, args: ArgValues) -> Result<CallResult, RunError> {
+    fn call_function(&mut self, callable: &Value, args: ArgValues) -> Result<CallResult, RunError> {
         match callable {
             Value::Builtin(builtin) => {
-                let result = builtin.call(self.heap, args, self.interns, self.print_writer)?;
+                let result = builtin.call(self, args)?;
                 Ok(CallResult::Push(result))
             }
             Value::ModuleFunction(mf) => {
@@ -317,15 +375,15 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             }
             Value::ExtFunction(ext_id) => {
                 // External function - return to caller to execute
-                Ok(CallResult::External(ext_id, args))
+                Ok(CallResult::External(*ext_id, args))
             }
             Value::DefFunction(func_id) => {
                 // Defined function without defaults or captured variables
-                self.call_def_function(func_id, &[], Vec::new(), args)
+                self.call_def_function(*func_id, &[], Vec::new(), args)
             }
             Value::Ref(heap_id) => {
                 // Could be a closure or function with defaults - check heap
-                self.call_heap_callable(heap_id, callable, args)
+                self.call_heap_callable(*heap_id, args)
             }
             _ => {
                 args.drop_with_heap(self.heap);
@@ -339,17 +397,9 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// Uses a two-phase approach to avoid borrow conflicts:
     /// 1. Copy data without incrementing refcounts
     /// 2. Increment refcounts after the borrow ends
-    fn call_heap_callable(
-        &mut self,
-        heap_id: HeapId,
-        callable: Value,
-        args: ArgValues,
-    ) -> Result<CallResult, RunError> {
-        let this = self;
-        defer_drop!(callable, this);
-
+    fn call_heap_callable(&mut self, heap_id: HeapId, args: ArgValues) -> Result<CallResult, RunError> {
         // Phase 1: Copy data (func_id, cells, defaults) without refcount changes
-        let (func_id, cells, defaults) = match this.heap.get(heap_id) {
+        let (func_id, cells, defaults) = match self.heap.get(heap_id) {
             HeapData::Closure(fid, cells, defaults) => {
                 let cloned_cells = cells.clone();
                 let cloned_defaults: Vec<Value> = defaults.iter().map(Value::copy_for_extend).collect();
@@ -360,23 +410,23 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 (*fid, Vec::new(), cloned_defaults)
             }
             _ => {
-                args.drop_with_heap(this.heap);
+                args.drop_with_heap(self.heap);
                 return Err(ExcType::type_error("object is not callable"));
             }
         };
 
         // Phase 2: Increment refcounts now that the heap borrow has ended
         for &cell_id in &cells {
-            this.heap.inc_ref(cell_id);
+            self.heap.inc_ref(cell_id);
         }
         for default in &defaults {
             if let Value::Ref(id) = default {
-                this.heap.inc_ref(*id);
+                self.heap.inc_ref(*id);
             }
         }
 
         // Call the defined function (callable guard drops at scope exit)
-        this.call_def_function(func_id, &cells, defaults, args)
+        self.call_def_function(func_id, &cells, defaults, args)
     }
 
     /// Calls a function with unpacked args tuple and optional kwargs dict.
@@ -390,6 +440,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     ) -> Result<CallResult, RunError> {
         let this = self;
         defer_drop!(args_tuple, this);
+        defer_drop!(callable, this);
 
         // Extract positional args from tuple
         let copied_args = this.extract_args_tuple(args_tuple);
