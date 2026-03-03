@@ -1679,7 +1679,26 @@ impl<'i> Prepare<'i> {
             );
         }
 
-        // 5. Check if exists in enclosing scope (implicit closure capture)
+        // 5. Check if name was pre-populated in name_map (from function parameters)
+        // This ensures parameters shadow both enclosing locals and global variables
+        // with the same name. Parameters are added to name_map during
+        // FunctionScope::new_function() but are NOT in assigned_names (since they're
+        // not assigned in the function body). This MUST be checked before
+        // enclosing_locals, otherwise a parameter like `def inner(x)` would be
+        // incorrectly resolved as a closure capture when an outer scope also has `x`.
+        // Excludes names tracked in `unassigned_ref_names` — those were added to
+        // `name_map` by step 8 as `LocalUnassigned` references and must stay that way
+        // to trigger NameLookup at runtime (e.g., for external function resolution).
+        if !self.unassigned_ref_names.contains(name_str)
+            && let Some(&id) = self.name_map.get(name_str)
+        {
+            return (
+                Identifier::new_with_scope(ident.name_id, ident.position, id, NameScope::Local),
+                false, // Not new - was pre-populated from parameters
+            );
+        }
+
+        // 6. Check if exists in enclosing scope (implicit closure capture)
         // This handles reading variables from enclosing functions without explicit `nonlocal`
         if let Some(ref enclosing) = self.enclosing_locals
             && enclosing.contains(name_str)
@@ -1698,19 +1717,6 @@ impl<'i> Prepare<'i> {
             return (
                 Identifier::new_with_scope(ident.name_id, ident.position, slot, NameScope::Cell),
                 false, // Not a new local - it's captured from enclosing scope
-            );
-        }
-
-        // 6. Check if name was pre-populated in name_map (from function parameters,
-        // comprehension targets, etc.). Excludes names that were added by step 8 as
-        // `LocalUnassigned` references - those must stay `LocalUnassigned` to trigger
-        // NameLookup at runtime for external function resolution.
-        if !self.unassigned_ref_names.contains(name_str)
-            && let Some(&id) = self.name_map.get(name_str)
-        {
-            return (
-                Identifier::new_with_scope(ident.name_id, ident.position, id, NameScope::Local),
-                false, // Not new - was pre-populated from parameters
             );
         }
 
