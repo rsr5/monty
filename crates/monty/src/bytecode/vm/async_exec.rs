@@ -304,7 +304,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             stack_base,
             locals_count,
             func_id,
-            Some(call_position),
+            call_position,
         ))?;
 
         Ok(())

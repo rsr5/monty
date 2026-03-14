@@ -25,6 +25,7 @@ mod repl;
 mod resource;
 mod run;
 mod run_progress;
+mod session;
 mod signature;
 mod sorting;
 mod types;
@@ -49,4 +50,5 @@ pub use crate::{
     run_progress::{
         ExtFunctionResult, FunctionCall, NameLookup, NameLookupResult, OsCall, ResolveFutures, RunProgress,
     },
+    session::MontySession,
 };

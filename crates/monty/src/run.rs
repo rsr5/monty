@@ -13,6 +13,7 @@ use crate::{
     prepare::prepare,
     resource::{NoLimitTracker, ResourceTracker},
     run_progress::{RunProgress, build_run_progress, check_snapshot_from_converted, convert_frame_exit},
+    session::MontySession,
     value::Value,
 };
 
@@ -158,6 +159,34 @@ impl MontyRun {
         let vm_state = check_snapshot_from_converted(&converted, vm);
         build_run_progress(converted, vm_state, executor, heap)
     }
+
+    /// Creates a persistent session by running the initial code and retaining state.
+    ///
+    /// The code is executed to completion (defining functions, assigning variables, etc.),
+    /// then the heap and global namespace are retained so that Python-defined functions
+    /// can be called repeatedly from Rust via [`MontySession::call_function`].
+    ///
+    /// # Arguments
+    /// * `resource_tracker` — Resource tracker for limiting memory, time, etc.
+    ///
+    /// # Errors
+    /// Returns `MontyException` if the setup code raises an exception.
+    pub fn into_session<T: ResourceTracker>(self, resource_tracker: T) -> Result<MontySession<T>, MontyException> {
+        self.into_session_with_print(resource_tracker, PrintWriter::Stdout)
+    }
+
+    /// Creates a persistent session with a custom print writer for setup execution.
+    ///
+    /// Same as [`into_session`](Self::into_session) but allows capturing print output
+    /// during the initial code execution.
+    pub fn into_session_with_print<T: ResourceTracker>(
+        self,
+        resource_tracker: T,
+        print: PrintWriter<'_>,
+    ) -> Result<MontySession<T>, MontyException> {
+        let name_map = self.executor.name_map.clone();
+        MontySession::new(self.executor, name_map, resource_tracker, print)
+    }
 }
 
 /// Lower level interface to parse code and run it to completion.
@@ -168,9 +197,11 @@ impl MontyRun {
 pub(crate) struct Executor {
     /// Number of slots needed in the global namespace.
     pub(crate) namespace_size: usize,
-    /// Maps variable names to their indices in the namespace. Used for ref-count testing.
-    #[cfg(feature = "ref-count-return")]
-    name_map: ahash::AHashMap<String, crate::namespace::NamespaceId>,
+    /// Maps variable names to their namespace slot indices.
+    ///
+    /// Used by [`MontySession`](crate::MontySession) to look up functions by name,
+    /// and by ref-count tests for variable inspection.
+    pub(crate) name_map: ahash::AHashMap<String, crate::namespace::NamespaceId>,
     /// Compiled bytecode for the module.
     pub(crate) module_code: Code,
     /// Interned strings used for looking up names and filenames during execution.
@@ -186,7 +217,6 @@ impl Clone for Executor {
     fn clone(&self) -> Self {
         Self {
             namespace_size: self.namespace_size,
-            #[cfg(feature = "ref-count-return")]
             name_map: self.name_map.clone(),
             module_code: self.module_code.clone(),
             interns: self.interns.clone(),
@@ -215,7 +245,6 @@ impl Executor {
 
         Ok(Self {
             namespace_size: prepared.namespace_size,
-            #[cfg(feature = "ref-count-return")]
             name_map: prepared.name_map,
             module_code: compile_result.code,
             interns,
