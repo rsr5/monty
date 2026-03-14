@@ -689,6 +689,10 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     /// Locals are built directly on the VM stack using a [`StackGuard`] that
     /// automatically rolls back on error. The frame's `stack_base` points to
     /// the start of this locals region, and operands are pushed above it.
+    ///
+    /// The call position is captured from [`current_position`](Self::current_position),
+    /// which returns `None` when no frames are on the stack (e.g. host-initiated
+    /// calls via [`MontyRepl`](crate::MontyRepl)).
     fn call_sync_function(
         &mut self,
         func_id: FunctionId,
@@ -761,7 +765,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
             stack_base,
             locals_count,
             func_id,
-            Some(call_position),
+            call_position,
         ))?;
 
         Ok(CallResult::FramePushed)

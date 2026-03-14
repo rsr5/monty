@@ -29,7 +29,11 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
     ///
     /// Used when raising exceptions to capture traceback information.
     fn make_stack_frame(&self) -> RawStackFrame {
-        RawStackFrame::new(self.current_position(), self.current_frame_name(), None)
+        RawStackFrame::new(
+            self.current_position().unwrap_or_default(),
+            self.current_frame_name(),
+            None,
+        )
     }
 
     /// Attaches initial frame information to an error if it doesn't have any.
@@ -91,7 +95,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         // Create frame with appropriate hide_caret setting
         let frame = if is_raise {
-            RawStackFrame::from_raise(this.current_position(), this.current_frame_name())
+            RawStackFrame::from_raise(this.current_position().unwrap_or_default(), this.current_frame_name())
         } else {
             this.make_stack_frame()
         };

@@ -13,10 +13,12 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     ExcType, MontyException,
+    args::{ArgValues, KwargsValues},
     asyncio::CallId,
-    bytecode::{VM, VMSnapshot},
+    bytecode::{FrameExit, VM, VMSnapshot},
     exception_private::RunError,
     heap::{DropWithHeap, Heap, HeapReader},
+    heap_data::HeapData,
     intern::{InternerBuilder, Interns},
     io::PrintWriter,
     namespace::NamespaceId,
@@ -90,6 +92,82 @@ impl<T: ResourceTracker> MontyRepl<T> {
     /// async cancellation flags, before calling `feed_start()`.
     pub fn tracker_mut(&mut self) -> &mut T {
         self.heap.tracker_mut()
+    }
+
+    /// Creates a session pre-seeded with compiled code and execution state.
+    ///
+    /// Runs the initial code to completion (defining functions, assigning variables,
+    /// etc.), then retains the heap and global namespace so that functions can be
+    /// called via [`call_function`](Self::call_function).
+    ///
+    /// # Errors
+    /// Returns `MontyException` if the setup code raises an exception.
+    pub(crate) fn from_executor(
+        executor: Executor,
+        name_map: AHashMap<String, NamespaceId>,
+        resource_tracker: T,
+        mut print: PrintWriter<'_>,
+    ) -> Result<Self, MontyException> {
+        let namespace_size = executor.namespace_size;
+        let module_code = executor.module_code;
+        let interns = executor.interns;
+        let code = executor.code;
+        let mut heap = Heap::new(namespace_size, resource_tracker);
+
+        let globals = HeapReader::with(&mut heap, |heap| {
+            let globals = (0..namespace_size).map(|_| Value::Undefined).collect();
+            let mut vm = VM::new(globals, heap, &interns, print.reborrow());
+
+            let mut frame_exit_result = vm.run_module(&module_code);
+
+            // Handle NameLookup and ExternalCall exits by raising NameError —
+            // during session setup, there's no host to resolve these.
+            loop {
+                match frame_exit_result {
+                    Ok(FrameExit::NameLookup { name_id, .. }) => {
+                        let name = interns.get_str(name_id);
+                        let err = ExcType::name_error(name);
+                        frame_exit_result = vm.resume_with_exception(err.into());
+                    }
+                    Ok(FrameExit::ExternalCall {
+                        function_name,
+                        args,
+                        name_load_ip,
+                        ..
+                    }) => {
+                        if let Some(load_ip) = name_load_ip {
+                            vm.set_instruction_ip(load_ip);
+                        }
+                        let name = function_name.as_str(&interns);
+                        args.drop_with_heap(&mut vm);
+                        let err = ExcType::name_error(name);
+                        frame_exit_result = vm.resume_with_exception(err.into());
+                    }
+                    _ => break,
+                }
+            }
+
+            // Check for runtime errors
+            let exit = frame_exit_result.map_err(|e| e.into_python_exception(&interns, &code))?;
+
+            // Drop the module return value (we only care about side effects)
+            if let FrameExit::Return(value) = exit {
+                value.drop_with_heap(&mut vm);
+            }
+
+            let globals = vm.take_globals();
+            vm.cleanup();
+            Ok(globals)
+        })?;
+
+        Ok(Self {
+            script_name: String::new(),
+            next_input_id: 0,
+            global_name_map: name_map,
+            interns,
+            heap,
+            globals,
+        })
     }
 
     /// Starts executing a new snippet and returns suspendable REPL progress.
@@ -230,6 +308,113 @@ impl<T: ResourceTracker> MontyRepl<T> {
         self.interns = interns;
 
         result.map_err(|e| e.into_python_exception(&self.interns, &code))
+    }
+
+    /// Calls a Python function defined in the session by name.
+    ///
+    /// Looks up the function in the global namespace, converts the arguments,
+    /// executes the function, and converts the result back.
+    ///
+    /// # Errors
+    /// Returns `MontyException` if the function is not found, not callable,
+    /// raises an exception, or encounters an external function call.
+    pub fn call_function(&mut self, name: &str, args: Vec<MontyObject>) -> Result<MontyObject, MontyException> {
+        self.call_function_with_print(name, args, PrintWriter::Stdout)
+    }
+
+    /// Calls a Python function with a custom print writer.
+    ///
+    /// Same as [`call_function`](Self::call_function) but allows capturing print output.
+    pub fn call_function_with_print(
+        &mut self,
+        name: &str,
+        args: Vec<MontyObject>,
+        mut print: PrintWriter<'_>,
+    ) -> Result<MontyObject, MontyException> {
+        let slot_idx = self
+            .resolve_callable_slot(name)
+            .map_err(|e| e.into_python_exception(&self.interns, ""))?;
+
+        HeapReader::with(&mut self.heap, |heap| {
+            let mut vm = VM::new(mem::take(&mut self.globals), heap, &self.interns, print.reborrow());
+
+            let callable = vm.globals[slot_idx].clone_with_heap(&vm);
+
+            let arg_values = match convert_args(args, &mut vm) {
+                Ok(av) => av,
+                Err(e) => {
+                    callable.drop_with_heap(&mut vm);
+                    self.globals = vm.take_globals();
+                    vm.cleanup();
+                    return Err(e);
+                }
+            };
+
+            let result = vm.run_callable(&callable, arg_values);
+
+            let py_result = match result {
+                Ok(value) => Ok(MontyObject::new(value, &mut vm)),
+                Err(err) => Err(err),
+            };
+
+            callable.drop_with_heap(&mut vm);
+            self.globals = vm.take_globals();
+            vm.cleanup();
+
+            py_result.map_err(|e| e.into_python_exception(&self.interns, ""))
+        })
+    }
+
+    /// Returns a list of all callable function names defined in the session.
+    ///
+    /// Includes functions, closures, and functions with default arguments.
+    /// Does not include builtins or external functions.
+    #[must_use]
+    pub fn function_names(&self) -> Vec<&str> {
+        self.global_name_map
+            .iter()
+            .filter_map(|(name, ns_id)| {
+                let idx = ns_id.index();
+                if idx < self.globals.len() && is_callable(&self.globals[idx], &self.heap) {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns whether a function with the given name exists in the session.
+    #[must_use]
+    pub fn has_function(&self, name: &str) -> bool {
+        self.global_name_map.get(name).is_some_and(|ns_id| {
+            let idx = ns_id.index();
+            idx < self.globals.len() && is_callable(&self.globals[idx], &self.heap)
+        })
+    }
+
+    /// Resolves a function name to its global slot index, validating it's callable.
+    fn resolve_callable_slot(&self, name: &str) -> Result<usize, RunError> {
+        let ns_id = self
+            .global_name_map
+            .get(name)
+            .ok_or_else(|| -> RunError { ExcType::name_error(name).into() })?;
+
+        let idx = ns_id.index();
+        if idx >= self.globals.len() {
+            return Err(ExcType::name_error(name).into());
+        }
+
+        let value = &self.globals[idx];
+        if matches!(value, Value::Undefined) {
+            return Err(ExcType::name_error(name).into());
+        }
+
+        if !is_callable(value, &self.heap) {
+            return Err(ExcType::type_error(format!("'{name}' is not callable")));
+        }
+
+        Ok(idx)
     }
 
     /// Grows the globals vector to at least `size` slots.
@@ -1003,5 +1188,71 @@ fn build_repl_progress<T: ResourceTracker>(
             repl.interns = interns;
             Err(Box::new(ReplStartError { repl, error }))
         }
+    }
+}
+
+/// Converts `Vec<MontyObject>` to internal `ArgValues` for function calls.
+fn convert_args(
+    args: Vec<MontyObject>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> Result<ArgValues, MontyException> {
+    match args.len() {
+        0 => Ok(ArgValues::Empty),
+        1 => {
+            let value = args
+                .into_iter()
+                .next()
+                .expect("checked len")
+                .to_value(vm)
+                .map_err(|e| MontyException::runtime_error(format!("invalid argument type: {e}")))?;
+            Ok(ArgValues::One(value))
+        }
+        2 => {
+            let mut iter = args.into_iter();
+            let a = iter
+                .next()
+                .expect("checked len")
+                .to_value(vm)
+                .map_err(|e| MontyException::runtime_error(format!("invalid argument type: {e}")))?;
+            match iter.next().expect("checked len").to_value(vm) {
+                Ok(b) => Ok(ArgValues::Two(a, b)),
+                Err(e) => {
+                    a.drop_with_heap(&mut *vm);
+                    Err(MontyException::runtime_error(format!("invalid argument type: {e}")))
+                }
+            }
+        }
+        _ => {
+            let mut values = Vec::with_capacity(args.len());
+            for arg in args {
+                match arg.to_value(vm) {
+                    Ok(value) => values.push(value),
+                    Err(e) => {
+                        values.drain(..).drop_with_heap(&mut *vm);
+                        return Err(MontyException::runtime_error(format!("invalid argument type: {e}")));
+                    }
+                }
+            }
+            Ok(ArgValues::ArgsKargs {
+                args: values,
+                kwargs: KwargsValues::Empty,
+            })
+        }
+    }
+}
+
+/// Returns `true` if the value is a callable type.
+///
+/// For heap-allocated values (`Ref`), checks the actual `HeapData` variant
+/// rather than accepting all refs — only closures, functions with defaults,
+/// and heap-allocated external functions are callable.
+fn is_callable(value: &Value, heap: &Heap<impl ResourceTracker>) -> bool {
+    match value {
+        Value::DefFunction(_) | Value::Builtin(_) | Value::ExtFunction(_) | Value::ModuleFunction(_) => true,
+        Value::Ref(id) => matches!(
+            heap.get(*id),
+            HeapData::Closure(_) | HeapData::FunctionDefaults(_) | HeapData::ExtFunction(_)
+        ),
+        _ => false,
     }
 }

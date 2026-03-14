@@ -697,6 +697,47 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
         self.run()
     }
 
+    /// Calls a callable value and runs it to completion, returning the result.
+    ///
+    /// Unlike [`evaluate_function`](Self::evaluate_function), this method can be
+    /// called when no frames are on the stack (e.g. from [`MontyRepl`](crate::MontyRepl)).
+    /// It handles both frame-pushing callables (user-defined functions) and
+    /// immediate callables (builtins) that return a value directly.
+    ///
+    /// Returns an error if the callable invokes an external function, since this
+    /// synchronous path cannot suspend.
+    pub(crate) fn run_callable(&mut self, callable: &Value, args: ArgValues) -> Result<Value, RunError> {
+        match self.call_function(callable, args)? {
+            CallResult::Value(v) => Ok(v),
+            CallResult::FramePushed => {
+                // Mark the frame so the run loop exits when it returns
+                self.current_frame_mut().should_return = true;
+                match self.run()? {
+                    FrameExit::Return(v) => Ok(v),
+                    FrameExit::ResolveFutures(_)
+                    | FrameExit::ExternalCall { .. }
+                    | FrameExit::OsCall { .. }
+                    | FrameExit::MethodCall { .. }
+                    | FrameExit::NameLookup { .. } => {
+                        // Pop any remaining frames from this failed evaluation
+                        while !self.frames.is_empty() {
+                            self.pop_frame();
+                        }
+                        Err(RunError::internal(
+                            "MontyRepl::call_function: external functions are not supported in this context",
+                        ))
+                    }
+                }
+            }
+            CallResult::External(_, _)
+            | CallResult::OsCall(_, _)
+            | CallResult::MethodCall(_, _)
+            | CallResult::AwaitValue(_) => Err(RunError::internal(
+                "MontyRepl::call_function: external functions are not supported in this context",
+            )),
+        }
+    }
+
     /// Cleans up VM state before the VM is dropped.
     ///
     /// This method must be called before the VM goes out of scope to ensure
@@ -1717,19 +1758,23 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
         self.heap.collect_garbage(roots);
     }
 
-    /// Returns the current source position for traceback generation.
+    /// Returns the current source position for traceback generation, or `None`
+    /// when no frames are on the stack (e.g. host-initiated calls via
+    /// [`MontyRepl`](crate::MontyRepl)).
     ///
     /// Uses `instruction_ip` which is set at the start of each instruction in the run loop,
     /// ensuring accurate position tracking even when using cached IP for bytecode fetching.
-    pub(super) fn current_position(&self) -> CodeRange {
-        let frame = self.current_frame();
+    pub(super) fn current_position(&self) -> Option<CodeRange> {
+        let frame = self.frames.last()?;
         // Use instruction_ip which points to the start of the current instruction
         // (set at the beginning of each loop iteration in run())
-        frame
-            .code
-            .location_for_offset(self.instruction_ip)
-            .map(LocationEntry::range)
-            .unwrap_or_default()
+        Some(
+            frame
+                .code
+                .location_for_offset(self.instruction_ip)
+                .map(LocationEntry::range)
+                .unwrap_or_default(),
+        )
     }
 
     // ========================================================================

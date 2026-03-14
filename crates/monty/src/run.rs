@@ -14,6 +14,7 @@ use crate::{
     object::MontyObject,
     parse::{parse, parse_with_interner},
     prepare::{prepare, prepare_with_existing_names},
+    repl::MontyRepl,
     resource::{NoLimitTracker, ResourceTracker},
     run_progress::{RunProgress, build_run_progress, check_snapshot_from_converted, convert_frame_exit},
     value::Value,
@@ -164,6 +165,34 @@ impl MontyRun {
         })?;
         build_run_progress(converted, vm_state, executor, heap)
     }
+
+    /// Creates a persistent session by running the initial code and retaining state.
+    ///
+    /// The code is executed to completion (defining functions, assigning variables, etc.),
+    /// then the heap and global namespace are retained so that Python-defined functions
+    /// can be called repeatedly from Rust via [`MontyRepl::call_function`].
+    ///
+    /// # Arguments
+    /// * `resource_tracker` — Resource tracker for limiting memory, time, etc.
+    ///
+    /// # Errors
+    /// Returns `MontyException` if the setup code raises an exception.
+    pub fn into_repl<T: ResourceTracker>(self, resource_tracker: T) -> Result<MontyRepl<T>, MontyException> {
+        self.into_repl_with_print(resource_tracker, PrintWriter::Stdout)
+    }
+
+    /// Creates a persistent REPL session with a custom print writer for setup execution.
+    ///
+    /// Same as [`into_repl`](Self::into_repl) but allows capturing print output
+    /// during the initial code execution.
+    pub fn into_repl_with_print<T: ResourceTracker>(
+        self,
+        resource_tracker: T,
+        print: PrintWriter<'_>,
+    ) -> Result<MontyRepl<T>, MontyException> {
+        let name_map = self.executor.name_map.clone();
+        MontyRepl::from_executor(self.executor, name_map, resource_tracker, print)
+    }
 }
 
 /// Lower level interface to parse code and run it to completion.
@@ -179,6 +208,7 @@ pub(crate) struct Executor {
     /// Used by:
     /// - ref-count tests for looking up variables by name
     /// - REPL incremental compilation to preserve stable global slot IDs across snippets
+    /// - [`MontyRepl::call_function`](crate::MontyRepl) to look up functions by name
     pub(crate) name_map: AHashMap<String, NamespaceId>,
     /// Compiled bytecode for the module.
     pub(crate) module_code: Code,
