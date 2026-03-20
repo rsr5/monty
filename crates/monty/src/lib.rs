@@ -40,7 +40,7 @@ pub use crate::{
     object::{DictPairs, InvalidInputError, MontyObject},
     os::{OsFunction, dir_stat, file_stat, stat_result, symlink_stat},
     repl::{
-        MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
+        MontyRepl, MontySession, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
         ReplResolveFutures, ReplStartError, detect_repl_continuation_mode,
     },
     resource::{
@@ -50,5 +50,4 @@ pub use crate::{
     run_progress::{
         ExtFunctionResult, FunctionCall, NameLookup, NameLookupResult, OsCall, ResolveFutures, RunProgress,
     },
-    session::MontySession,
 };

@@ -11,9 +11,9 @@ use crate::{
     object::MontyObject,
     parse::parse,
     prepare::prepare,
+    repl::MontySession,
     resource::{NoLimitTracker, ResourceTracker},
     run_progress::{RunProgress, build_run_progress, check_snapshot_from_converted, convert_frame_exit},
-    session::MontySession,
     value::Value,
 };
 
@@ -185,7 +185,7 @@ impl MontyRun {
         print: PrintWriter<'_>,
     ) -> Result<MontySession<T>, MontyException> {
         let name_map = self.executor.name_map.clone();
-        MontySession::new(self.executor, name_map, resource_tracker, print)
+        MontySession::from_executor(self.executor, name_map, resource_tracker, print)
     }
 }
 
