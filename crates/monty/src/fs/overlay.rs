@@ -298,11 +298,12 @@ fn mkdir(
         Some(OverlayEntry::Deleted) => {}
         None => {
             if let Ok(resolved) = resolve_path(vpath, ctx.mount_virtual, ctx.mount_host, ResolveMode::Existing)
-                && resolved.host_path.exists()
+                && let Ok(meta) = resolved.host_path.symlink_metadata()
             {
-                return if exist_ok {
+                return if meta.is_dir() && exist_ok {
                     Ok(MontyObject::None)
                 } else {
+                    // Either it's a file (always an error) or a dir with exist_ok=false.
                     Err(MountError::io_err(ErrorKind::AlreadyExists, "File exists", vpath))
                 };
             }
@@ -591,6 +592,25 @@ fn rename(
         return Err(MountError::not_found(src_vpath));
     }
 
+    // Determine whether the source is a directory before removing it from state,
+    // so that validation checks below don't lose the entry on failure.
+    let src_is_dir = match state.get(&src_rel) {
+        Some(OverlayEntry::Directory { .. }) => true,
+        Some(OverlayEntry::File(_) | OverlayEntry::RealFileRef(_)) => false,
+        Some(OverlayEntry::Deleted) => return Err(MountError::not_found(src_vpath)),
+        None => resolve_path(src_vpath, ctx.mount_virtual, ctx.mount_host, ResolveMode::Lstat)
+            .is_ok_and(|r| r.host_path.is_dir()),
+    };
+
+    reject_rename_type_mismatch(state, &dst_rel, src_is_dir, ctx, dst_vpath)?;
+
+    // Renaming a directory onto an existing non-empty directory must fail,
+    // matching POSIX/CPython semantics.
+    if src_is_dir {
+        reject_rename_onto_nonempty_dir(state, &dst_rel, ctx, dst_vpath)?;
+    }
+
+    // Now that validation has passed, remove the source entry from state.
     let entry = if let Some(entry) = state.remove(&src_rel) {
         entry
     } else {
@@ -618,9 +638,6 @@ fn rename(
             return Err(MountError::not_found(src_vpath));
         }
     };
-
-    let src_is_dir = matches!(entry, OverlayEntry::Directory { .. });
-    reject_rename_type_mismatch(state, &dst_rel, src_is_dir, ctx, dst_vpath)?;
 
     // Reject renaming a directory into its own descendant.
     if src_is_dir {
@@ -708,6 +725,50 @@ fn reject_rename_type_mismatch(
         )),
         _ => Ok(()),
     }
+}
+
+/// Rejects renaming a directory onto an existing non-empty directory.
+///
+/// Matches POSIX semantics: `rename(src_dir, dst_dir)` only succeeds when
+/// `dst_dir` is empty. Checks both overlay children and real filesystem
+/// children, reusing the same helpers as `rmdir`.
+fn reject_rename_onto_nonempty_dir(
+    state: &OverlayState,
+    dst_rel: &str,
+    ctx: &MountContext<'_>,
+    dst_vpath: &str,
+) -> Result<(), MountError> {
+    let dst_is_dir = match state.get(dst_rel) {
+        Some(OverlayEntry::Directory { .. }) => true,
+        Some(OverlayEntry::Deleted | OverlayEntry::File(_) | OverlayEntry::RealFileRef(_)) => return Ok(()),
+        None => match resolve_path(dst_vpath, ctx.mount_virtual, ctx.mount_host, ResolveMode::Existing) {
+            Ok(resolved) if resolved.host_path.is_dir() => true,
+            _ => return Ok(()),
+        },
+    };
+
+    if !dst_is_dir {
+        return Ok(());
+    }
+
+    if overlay_directory_has_children(state, dst_rel) {
+        return Err(MountError::io_err(
+            ErrorKind::DirectoryNotEmpty,
+            "Directory not empty",
+            dst_vpath,
+        ));
+    }
+    if let Ok(resolved) = resolve_path(dst_vpath, ctx.mount_virtual, ctx.mount_host, ResolveMode::Existing)
+        && real_directory_has_visible_children(state, dst_rel, &resolved.host_path, dst_vpath)?
+    {
+        return Err(MountError::io_err(
+            ErrorKind::DirectoryNotEmpty,
+            "Directory not empty",
+            dst_vpath,
+        ));
+    }
+
+    Ok(())
 }
 
 /// Recursively collects real descendants that should follow an overlay rename.

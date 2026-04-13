@@ -59,7 +59,7 @@ impl MountTable {
     /// Adds a pre-built [`Mount`] to the table.
     ///
     /// Use this when a `Mount` was constructed elsewhere (e.g. owned by a Python
-    /// `MountDirectory` and temporarily taken for the duration of a run).
+    /// `MountDir` and temporarily taken for the duration of a run).
     pub fn push_mount(&mut self, mount: Mount) {
         // Keep mounts sorted longest-prefix-first so dispatch can stop at the
         // first match without re-sorting the whole table on every insertion.
@@ -86,12 +86,21 @@ impl MountTable {
     /// Returns an error message if any mutex is poisoned or any mount is
     /// already taken (concurrent use).
     pub fn take_shared_mounts(slots: &[Arc<Mutex<Option<Mount>>>]) -> Result<Self, String> {
-        let mut table = Self::new();
+        let mut taken: Vec<Mount> = Vec::with_capacity(slots.len());
         for (i, shared) in slots.iter().enumerate() {
-            let mut guard = shared.lock().map_err(|_| format!("mount {i} lock is poisoned"))?;
-            let mount = guard
-                .take()
-                .ok_or_else(|| format!("mount {i} is already in use by another run"))?;
+            let Ok(mut guard) = shared.lock() else {
+                rollback_taken_mounts(taken, &slots[..i]);
+                return Err(format!("mount {i} lock is poisoned"));
+            };
+            let Some(mount) = guard.take() else {
+                drop(guard); // release this lock before restoring earlier slots
+                rollback_taken_mounts(taken, &slots[..i]);
+                return Err(format!("mount {i} is already in use by another run"));
+            };
+            taken.push(mount);
+        }
+        let mut table = Self::new();
+        for mount in taken {
             table.push_mount(mount);
         }
         Ok(table)
@@ -179,11 +188,23 @@ impl MountTable {
     }
 }
 
+/// Restores already-taken mounts back into their shared slots on failure.
+///
+/// Called by [`MountTable::take_shared_mounts`] when a later slot fails,
+/// so that earlier slots are not permanently emptied.
+fn rollback_taken_mounts(taken: Vec<Mount>, slots: &[Arc<Mutex<Option<Mount>>>]) {
+    for (shared, mount) in slots.iter().zip(taken) {
+        if let Ok(mut slot) = shared.lock() {
+            *slot = Some(mount);
+        }
+    }
+}
+
 /// A single mount point mapping a virtual path to a host directory.
 ///
 /// Owns the [`MountMode`] which includes overlay state for
 /// [`MountMode::OverlayMemory`] mounts. Can be stored externally (e.g. in a
-/// Python `MountDirectory`) and temporarily moved into a [`MountTable`] for
+/// Python `MountDir`) and temporarily moved into a [`MountTable`] for
 /// the duration of execution via [`MountTable::push_mount`] /
 /// [`MountTable::take_shared_mounts`].
 #[derive(Debug)]

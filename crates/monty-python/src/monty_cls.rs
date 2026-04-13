@@ -80,7 +80,7 @@ impl PyMonty {
         let input_names = list_str(inputs, "inputs")?;
 
         if type_check {
-            py_type_check(py, &code, script_name, type_check_stubs)?;
+            py_type_check(py, &code, script_name, type_check_stubs, "type_stubs.pyi")?;
         }
 
         // Create the snapshot (parses the code)
@@ -122,7 +122,7 @@ impl PyMonty {
     /// * `MontyTypingError` if type errors are found
     #[pyo3(signature = (prefix_code=None))]
     fn type_check(&self, py: Python<'_>, prefix_code: Option<&str>) -> PyResult<()> {
-        py_type_check(py, self.runner.code(), &self.script_name, prefix_code)
+        py_type_check(py, self.runner.code(), &self.script_name, prefix_code, "type_stubs.pyi")
     }
 
     /// Executes the code and returns the result.
@@ -390,8 +390,14 @@ impl PyMonty {
     }
 }
 
-fn py_type_check(py: Python<'_>, code: &str, script_name: &str, type_stubs: Option<&str>) -> PyResult<()> {
-    let type_stubs = type_stubs.map(|type_stubs| SourceFile::new(type_stubs, "type_stubs.pyi"));
+pub(crate) fn py_type_check(
+    py: Python<'_>,
+    code: &str,
+    script_name: &str,
+    type_stubs: Option<&str>,
+    stubs_name: &str,
+) -> PyResult<()> {
+    let type_stubs = type_stubs.map(|type_stubs| SourceFile::new(type_stubs, stubs_name));
 
     let opt_diagnostics =
         type_check(&SourceFile::new(code, script_name), type_stubs.as_ref()).map_err(PyRuntimeError::new_err)?;
@@ -645,7 +651,7 @@ where
 {
     match progress {
         ReplProgress::Complete { repl, value } => {
-            repl_owner.get().put_repl(EitherRepl::from_core(repl));
+            repl_owner.get().put_repl_after_commit(EitherRepl::from_core(repl));
             PyMontyComplete::create(py, &value, &dc_registry)
         }
         ReplProgress::FunctionCall(call) => {
@@ -1352,7 +1358,7 @@ impl PyNameLookupSnapshot {
     /// `ValueError` if serialization fails.
     /// `RuntimeError` if the progress has already been resumed.
     fn dump<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = serialization::dump_lookup_snapshot(&self.snapshot, &self.script_name, &self.variable_name)?;
+        let bytes = serialization::dump_lookup_snapshot(py, &self.snapshot, &self.script_name, &self.variable_name)?;
         Ok(PyBytes::new(py, &bytes))
     }
 
@@ -1597,7 +1603,7 @@ impl PyFutureSnapshot {
     /// `ValueError` if serialization fails.
     /// `RuntimeError` if the progress has already been resumed.
     fn dump<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = serialization::dump_future_snapshot(&self.snapshot, &self.script_name)?;
+        let bytes = serialization::dump_future_snapshot(py, &self.snapshot, &self.script_name)?;
         Ok(PyBytes::new(py, &bytes))
     }
 
@@ -1762,7 +1768,9 @@ fn restore_repl_from_repl_start_error<T: ResourceTracker>(
 where
     EitherRepl: FromCoreRepl<T>,
 {
-    repl_owner.get().put_repl(EitherRepl::from_core(err.repl));
+    repl_owner
+        .get()
+        .put_repl_after_rollback(EitherRepl::from_core(err.repl));
     MontyError::new_err(py, err.error)
 }
 

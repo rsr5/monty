@@ -659,7 +659,7 @@ fn call_function_that_calls_undefined_name_fails() {
         .call_function("call_missing", vec![], PrintWriter::Stdout)
         .unwrap_err();
     assert!(
-        err.to_string().contains("external functions are not supported"),
+        err.to_string().contains("external functions are not yet supported"),
         "got: {err}"
     );
 }
