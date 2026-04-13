@@ -15,7 +15,7 @@ use crate::{
     ExcType, MontyException,
     args::{ArgValues, KwargsValues},
     asyncio::CallId,
-    bytecode::{FrameExit, VM, VMSnapshot},
+    bytecode::{VM, VMSnapshot},
     exception_private::RunError,
     heap::{DropWithHeap, Heap, HeapReader},
     heap_data::HeapData,
@@ -92,82 +92,6 @@ impl<T: ResourceTracker> MontyRepl<T> {
     /// async cancellation flags, before calling `feed_start()`.
     pub fn tracker_mut(&mut self) -> &mut T {
         self.heap.tracker_mut()
-    }
-
-    /// Creates a session pre-seeded with compiled code and execution state.
-    ///
-    /// Runs the initial code to completion (defining functions, assigning variables,
-    /// etc.), then retains the heap and global namespace so that functions can be
-    /// called via [`call_function`](Self::call_function).
-    ///
-    /// # Errors
-    /// Returns `MontyException` if the setup code raises an exception.
-    pub(crate) fn from_executor(
-        executor: Executor,
-        name_map: AHashMap<String, NamespaceId>,
-        resource_tracker: T,
-        mut print: PrintWriter<'_>,
-    ) -> Result<Self, MontyException> {
-        let namespace_size = executor.namespace_size;
-        let module_code = executor.module_code;
-        let interns = executor.interns;
-        let code = executor.code;
-        let mut heap = Heap::new(namespace_size, resource_tracker);
-
-        let globals = HeapReader::with(&mut heap, |heap| {
-            let globals = (0..namespace_size).map(|_| Value::Undefined).collect();
-            let mut vm = VM::new(globals, heap, &interns, print.reborrow());
-
-            let mut frame_exit_result = vm.run_module(&module_code);
-
-            // Handle NameLookup and ExternalCall exits by raising NameError —
-            // during session setup, there's no host to resolve these.
-            loop {
-                match frame_exit_result {
-                    Ok(FrameExit::NameLookup { name_id, .. }) => {
-                        let name = interns.get_str(name_id);
-                        let err = ExcType::name_error(name);
-                        frame_exit_result = vm.resume_with_exception(err.into());
-                    }
-                    Ok(FrameExit::ExternalCall {
-                        function_name,
-                        args,
-                        name_load_ip,
-                        ..
-                    }) => {
-                        if let Some(load_ip) = name_load_ip {
-                            vm.set_instruction_ip(load_ip);
-                        }
-                        let name = function_name.as_str(&interns);
-                        args.drop_with_heap(&mut vm);
-                        let err = ExcType::name_error(name);
-                        frame_exit_result = vm.resume_with_exception(err.into());
-                    }
-                    _ => break,
-                }
-            }
-
-            // Check for runtime errors
-            let exit = frame_exit_result.map_err(|e| e.into_python_exception(&interns, &code))?;
-
-            // Drop the module return value (we only care about side effects)
-            if let FrameExit::Return(value) = exit {
-                value.drop_with_heap(&mut vm);
-            }
-
-            let globals = vm.take_globals();
-            vm.cleanup();
-            Ok(globals)
-        })?;
-
-        Ok(Self {
-            script_name: String::new(),
-            next_input_id: 0,
-            global_name_map: name_map,
-            interns,
-            heap,
-            globals,
-        })
     }
 
     /// Starts executing a new snippet and returns suspendable REPL progress.
@@ -318,27 +242,20 @@ impl<T: ResourceTracker> MontyRepl<T> {
     /// # Errors
     /// Returns `MontyException` if the function is not found, not callable,
     /// raises an exception, or encounters an external function call.
-    pub fn call_function(&mut self, name: &str, args: Vec<MontyObject>) -> Result<MontyObject, MontyException> {
-        self.call_function_with_print(name, args, PrintWriter::Stdout)
-    }
-
-    /// Calls a Python function with a custom print writer.
-    ///
-    /// Same as [`call_function`](Self::call_function) but allows capturing print output.
-    pub fn call_function_with_print(
+    pub fn call_function(
         &mut self,
         name: &str,
         args: Vec<MontyObject>,
         mut print: PrintWriter<'_>,
     ) -> Result<MontyObject, MontyException> {
-        let slot_idx = self
-            .resolve_callable_slot(name)
-            .map_err(|e| e.into_python_exception(&self.interns, ""))?;
+        let Some(slot_idx) = self.global_name_map.get(name) else {
+            return Err(RunError::from(ExcType::name_error(name)).into_python_exception(&self.interns, ""));
+        };
 
         HeapReader::with(&mut self.heap, |heap| {
             let mut vm = VM::new(mem::take(&mut self.globals), heap, &self.interns, print.reborrow());
 
-            let callable = vm.globals[slot_idx].clone_with_heap(&vm);
+            let callable = vm.globals[slot_idx.index()].clone_with_heap(&vm);
 
             let arg_values = match convert_args(args, &mut vm) {
                 Ok(av) => av,
@@ -391,30 +308,6 @@ impl<T: ResourceTracker> MontyRepl<T> {
             let idx = ns_id.index();
             idx < self.globals.len() && is_callable(&self.globals[idx], &self.heap)
         })
-    }
-
-    /// Resolves a function name to its global slot index, validating it's callable.
-    fn resolve_callable_slot(&self, name: &str) -> Result<usize, RunError> {
-        let ns_id = self
-            .global_name_map
-            .get(name)
-            .ok_or_else(|| -> RunError { ExcType::name_error(name).into() })?;
-
-        let idx = ns_id.index();
-        if idx >= self.globals.len() {
-            return Err(ExcType::name_error(name).into());
-        }
-
-        let value = &self.globals[idx];
-        if matches!(value, Value::Undefined) {
-            return Err(ExcType::name_error(name).into());
-        }
-
-        if !is_callable(value, &self.heap) {
-            return Err(ExcType::type_error(format!("'{name}' is not callable")));
-        }
-
-        Ok(idx)
     }
 
     /// Grows the globals vector to at least `size` slots.
