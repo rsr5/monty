@@ -310,7 +310,7 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
         args: ArgValues,
     ) -> Result<Value, RunError> {
         match self.call_function(callable, args)? {
-            CallResult::Value(v) => Ok(v),
+            CallResult::Value(v) => return Ok(v),
             CallResult::FramePushed => {
                 // A new frame was pushed for a defined function call - we need to run it
                 // to completion.
@@ -318,32 +318,30 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
                 // Mark the frame as an exit point from the `run()` loop
                 self.current_frame_mut().should_return = true;
                 match self.run()? {
-                    FrameExit::Return(v) => Ok(v),
+                    FrameExit::Return(v) => return Ok(v),
                     FrameExit::ResolveFutures(_)
                     | FrameExit::ExternalCall { .. }
                     | FrameExit::OsCall { .. }
                     | FrameExit::MethodCall { .. }
                     | FrameExit::NameLookup { .. } => {
                         // Pop frames off the stack from this failed evaluation
-                        while self.frames.len() > stack_depth {
+                        // (including the one just pushed)
+                        while self.frames.len() >= stack_depth {
                             self.pop_frame();
                         }
-                        Err(RunError::internal(format!(
-                            "{ctx}: external functions are not yet supported in this context"
-                        )))
                     }
                 }
             }
             CallResult::External(_, _)
             | CallResult::OsCall(_, _)
             | CallResult::MethodCall(_, _)
-            | CallResult::AwaitValue(_) => {
-                // External calls are not supported in this context since the caller doesn't support suspending
-                Err(RunError::internal(format!(
-                    "{ctx}: external functions are not yet supported in this context"
-                )))
-            }
+            | CallResult::AwaitValue(_) => {}
         }
+
+        Err(ExcType::not_implemented(format!(
+            "{ctx}: external functions are not yet supported in this context"
+        ))
+        .into())
     }
 
     /// Calls a callable value with the given arguments.
