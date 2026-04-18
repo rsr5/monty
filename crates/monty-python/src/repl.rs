@@ -20,9 +20,9 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 use crate::{
     async_dispatch::{ReplCleanupNotifier, await_repl_transition, dispatch_loop_repl},
-    convert::{get_docstring, monty_to_py, py_to_monty},
+    convert::{get_docstring, monty_to_py, py_to_monty_value},
     dataclass::DcRegistry,
-    exceptions::MontyError,
+    exceptions::{MontyError, exc_py_to_monty},
     external::{ExternalFunctionRegistry, dispatch_method_call},
     limits::{CancellationFlag, FutureCancellationGuard, PySignalTracker, extract_limits},
     monty_cls::{EitherProgress, call_os_callback_parts, extract_source_code, py_type_check},
@@ -1000,11 +1000,17 @@ fn extract_repl_inputs(
     let Some(inputs) = inputs else {
         return Ok(vec![]);
     };
+    // Both the key and the value are untrusted host values, so conversion
+    // failures (e.g. lone surrogates, non-string keys) surface as
+    // `MontyRuntimeError` rather than raw PyErrs.
     inputs
         .iter()
         .map(|(key, value)| {
-            let name = key.extract::<String>()?;
-            let obj = py_to_monty(&value, dc_registry)?;
+            let py = key.py();
+            let name = key
+                .extract::<String>()
+                .map_err(|e| MontyError::new_err(py, exc_py_to_monty(py, &e)))?;
+            let obj = py_to_monty_value(&value, dc_registry).map_err(|e| MontyError::new_err(py, e))?;
             Ok((name, obj))
         })
         .collect::<PyResult<_>>()
