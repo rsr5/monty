@@ -12,6 +12,7 @@ mod divmod;
 mod enumerate;
 mod filter;
 mod getattr;
+mod hasattr;
 mod hash;
 mod hex;
 mod id;
@@ -161,7 +162,7 @@ pub enum BuiltinsFunctions {
     // frozenset - handled by Type enum
     Getattr,
     // Globals,
-    // Hasattr,
+    Hasattr,
     Hash,
     // Help,
     Hex,
@@ -221,6 +222,7 @@ impl BuiltinsFunctions {
             Self::Enumerate => enumerate::builtin_enumerate(vm, args),
             Self::Filter => filter::builtin_filter(vm, args),
             Self::Getattr => getattr::builtin_getattr(vm, args),
+            Self::Hasattr => hasattr::builtin_hasattr(vm, args),
             Self::Hash => hash::builtin_hash(vm, args),
             Self::Hex => hex::builtin_hex(vm, args),
             Self::Id => id::builtin_id(vm, args),

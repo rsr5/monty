@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "monty"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -1784,7 +1784,7 @@ dependencies = [
 
 [[package]]
 name = "monty-bench"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "codspeed-criterion-compat",
  "criterion",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "monty-cli"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "clap",
  "monty",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "monty-datatest"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "ahash",
  "chrono",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "monty-fuzz"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "monty-js"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "monty",
  "monty_type_checking",
@@ -1844,9 +1844,12 @@ dependencies = [
 
 [[package]]
 name = "monty_type_checking"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
+ "codspeed-criterion-compat",
+ "criterion",
  "monty_typeshed",
+ "pprof",
  "pretty_assertions",
  "ruff_db",
  "ruff_python_ast",
@@ -1858,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "monty_typeshed"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "path-slash",
  "ruff_db",
@@ -2285,7 +2288,7 @@ dependencies = [
 
 [[package]]
 name = "pydantic-monty"
-version = "0.0.11"
+version = "0.0.14"
 dependencies = [
  "indexmap",
  "monty",
@@ -2297,6 +2300,7 @@ dependencies = [
  "pyo3-build-config",
  "send_wrapper",
  "serde",
+ "serde_json",
  "sha2",
  "tokio",
 ]

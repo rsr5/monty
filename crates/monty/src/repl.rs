@@ -50,6 +50,16 @@ pub struct MontyRepl<T: ResourceTracker> {
     global_name_map: AHashMap<String, NamespaceId>,
     /// Persistent intern table across snippets so intern/function IDs remain valid.
     interns: Interns,
+    /// Source text of every snippet that has been fed, keyed by its
+    /// generated script name (`<python-input-N>`).
+    ///
+    /// Required because a traceback raised in snippet N can include frames
+    /// from functions defined in snippet M < N. Those frames carry
+    /// `CodeRange` byte offsets that index into snippet M's source, so the
+    /// diagnostic pass must be able to look that source up by filename —
+    /// the current snippet's `Executor.code` is not sufficient.
+    #[serde(default)]
+    sources: AHashMap<String, String>,
     /// Persistent heap across snippets.
     heap: Heap<T>,
     /// Persistent global variable values across snippets.
@@ -74,6 +84,7 @@ impl<T: ResourceTracker> MontyRepl<T> {
             next_input_id: 0,
             global_name_map: AHashMap::new(),
             interns: Interns::new(InternerBuilder::default(), Vec::new()),
+            sources: AHashMap::new(),
             heap,
             globals: Vec::new(),
         }
@@ -129,6 +140,8 @@ impl<T: ResourceTracker> MontyRepl<T> {
         let (input_names, input_values): (Vec<_>, Vec<_>) = inputs.into_iter().unzip();
 
         let input_script_name = this.next_input_script_name();
+        // Preserve this snippet's source (see `feed_run` for rationale).
+        this.sources.insert(input_script_name.clone(), code.to_owned());
         let executor = match Executor::new_repl_snippet(
             code.to_owned(),
             &input_script_name,
@@ -191,6 +204,11 @@ impl<T: ResourceTracker> MontyRepl<T> {
         let (input_names, input_values): (Vec<_>, Vec<_>) = inputs.into_iter().unzip();
 
         let input_script_name = self.next_input_script_name();
+        // Preserve this snippet's source before anything can fail, so later
+        // tracebacks with frames from this snippet can still resolve line/
+        // column/preview information — `Executor.code` only survives until
+        // the next feed.
+        self.sources.insert(input_script_name.clone(), code.to_owned());
         let executor = Executor::new_repl_snippet(
             code.to_owned(),
             &input_script_name,
@@ -219,16 +237,13 @@ impl<T: ResourceTracker> MontyRepl<T> {
         // Commit compiler metadata even on runtime errors.
         // Snippets can mutate globals before raising, and those values may contain
         // FunctionId/StringId values that must be interpreted with the updated tables.
-        let Executor {
-            name_map,
-            interns,
-            code,
-            ..
-        } = executor;
+        let Executor { name_map, interns, .. } = executor;
         self.global_name_map = name_map;
         self.interns = interns;
 
-        result.map_err(|e| e.into_python_exception(&self.interns, &code))
+        // Resolve every traceback frame against the source of the snippet that
+        // produced it — frames from earlier snippets live in `self.sources`.
+        result.map_err(|e| e.into_python_exception(&self.interns, |fname| self.sources.get(fname).map(String::as_str)))
     }
 
     /// Calls a Python function defined in the session by name.
@@ -246,7 +261,8 @@ impl<T: ResourceTracker> MontyRepl<T> {
         mut print: PrintWriter<'_>,
     ) -> Result<MontyObject, MontyException> {
         let Some(slot_idx) = self.global_name_map.get(name) else {
-            return Err(RunError::from(ExcType::name_error(name)).into_python_exception(&self.interns, ""));
+            return Err(RunError::from(ExcType::name_error(name))
+                .into_python_exception(&self.interns, |fname| self.sources.get(fname).map(String::as_str)));
         };
 
         HeapReader::with(&mut self.heap, |heap| {
@@ -265,7 +281,9 @@ impl<T: ResourceTracker> MontyRepl<T> {
 
             let result = match vm.evaluate_function("MontyRepl::call_function", callable, arg_values) {
                 Ok(value) => Ok(MontyObject::new(value, vm)),
-                Err(e) => Err(e.into_python_exception(&self.interns, "")),
+                Err(e) => {
+                    Err(e.into_python_exception(&self.interns, |fname| self.sources.get(fname).map(String::as_str)))
+                }
             };
 
             self.globals = vm.take_globals();
@@ -760,49 +778,7 @@ impl<T: ResourceTracker> ReplResolveFutures<T> {
                 )));
             }
 
-            for (call_id, ext_result) in results {
-                match ext_result {
-                    ExtFunctionResult::Return(obj) => {
-                        if let Err(e) = vm.resolve_future(call_id, obj) {
-                            repl.globals = vm.take_globals();
-                            return Err(MontyException::runtime_error(format!(
-                                "Invalid return type for call {call_id}: {e}"
-                            )));
-                        }
-                    }
-                    ExtFunctionResult::Error(exc) => vm.fail_future(call_id, RunError::from(exc)),
-                    ExtFunctionResult::Future(_) => {}
-                    ExtFunctionResult::NotFound(function_name) => {
-                        vm.fail_future(call_id, ExtFunctionResult::not_found_exc(&function_name));
-                    }
-                }
-            }
-
-            if let Some(error) = vm.take_failed_task_error() {
-                repl.globals = vm.take_globals();
-                return Err(error.into_python_exception(&executor.interns, &executor.code));
-            }
-
-            let main_task_ready = vm.prepare_current_task_after_resolve();
-
-            let loaded_task = match vm.load_ready_task_if_needed() {
-                Ok(loaded) => loaded,
-                Err(e) => {
-                    repl.globals = vm.take_globals();
-                    return Err(e.into_python_exception(&executor.interns, &executor.code));
-                }
-            };
-
-            if !main_task_ready && !loaded_task {
-                let pending_call_ids = vm.get_pending_call_ids();
-                if !pending_call_ids.is_empty() {
-                    let vm_state = vm.snapshot();
-                    let pending_call_ids: Vec<u32> = pending_call_ids.iter().map(|id| id.raw()).collect();
-                    return Ok((ConvertedExit::ResolveFutures(pending_call_ids), Some(vm_state)));
-                }
-            }
-
-            let vm_result = vm.run();
+            let vm_result = vm.resume_with_resolved_futures(results);
 
             // Convert while VM alive, then snapshot or reclaim globals
             let converted = convert_frame_exit(vm_result, &mut vm);
@@ -1056,7 +1032,13 @@ fn build_repl_progress<T: ResourceTracker>(
             snapshot: new_repl_snapshot!(),
         })),
         ConvertedExit::Error(err) => {
-            let error = err.into_python_exception(&executor.interns, &executor.code);
+            // Resolve traceback frames against every snippet the REPL has
+            // seen, not just the currently-executing one. `executor.interns`
+            // is still required because it holds the StringIds referenced by
+            // the in-flight frames; `repl.sources` holds every snippet's
+            // source text and is what owns any older snippets' sources.
+            let error =
+                err.into_python_exception(&executor.interns, |fname| repl.sources.get(fname).map(String::as_str));
             // Commit compiler metadata even on runtime errors, matching feed() behavior.
             // Snippets can create new variables or functions before raising, and those
             // values may reference FunctionId/StringId values from the new tables.
