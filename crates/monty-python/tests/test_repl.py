@@ -188,6 +188,23 @@ def test_syntax_error_lone_surrogate():
     assert str(exc_info.value) == snapshot('source code is not valid UTF-8 (contains lone surrogates)')
 
 
+def test_syntax_error_stubs_lone_surrogate():
+    # Invalid UTF-8 in `MontyRepl(type_check_stubs=...)` surfaces as
+    # `MontySyntaxError`, matching the `Monty` constructor.
+    with pytest.raises(pydantic_monty.MontySyntaxError) as exc_info:
+        pydantic_monty.MontyRepl(type_check=True, type_check_stubs='\ud83d')
+    assert str(exc_info.value) == snapshot('type_check_stubs is not valid UTF-8 (contains lone surrogates)')
+
+
+def test_syntax_error_type_check_prefix_code_lone_surrogate():
+    # The standalone `MontyRepl.type_check(prefix_code=...)` also validates
+    # UTF-8 and raises `MontySyntaxError`.
+    repl = pydantic_monty.MontyRepl()
+    with pytest.raises(pydantic_monty.MontySyntaxError) as exc_info:
+        repl.type_check('1', prefix_code='\ud83d')
+    assert str(exc_info.value) == snapshot('type_check_stubs is not valid UTF-8 (contains lone surrogates)')
+
+
 def test_runtime_error_input_value_lone_surrogate():
     # An input string containing a lone surrogate fails UTF-8 conversion during
     # `py_to_monty`. We wrap the resulting `UnicodeEncodeError` as a
@@ -1306,3 +1323,10 @@ def test_repl_future_snapshot_resume_lone_surrogate_return_value():
     assert isinstance(final, pydantic_monty.MontyComplete)
     assert final.output == snapshot(42)
     assert repl.feed_run('1 + 1') == snapshot(2)
+
+
+def test_input_invalid_identifier():
+    repl = pydantic_monty.MontyRepl()
+    with pytest.raises(pydantic_monty.MontySyntaxError) as exc_info:
+        repl.feed_start('x', inputs={'foo.bar': 42})
+    assert str(exc_info.value) == snapshot("Input name 'foo.bar' not a valid identifier")
