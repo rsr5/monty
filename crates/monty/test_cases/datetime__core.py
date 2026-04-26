@@ -1180,3 +1180,28 @@ try:
     assert False, 'datetime with duplicate month should raise TypeError'
 except TypeError as e:
     assert str(e) == "argument for function given by name ('month') and position (2)", f'dt dup month: {e}'
+
+
+# === GC must follow datetime.tzinfo_ref ===
+# Regression: an aware datetime retains the tzinfo as a private heap reference
+# (so `dt.tzinfo is tz` identity holds across attribute lookups). Without GC
+# tracking that reference, a cycle-triggered collection could sweep the
+# tzinfo while the datetime still pointed at the freed slot, panicking on
+# the next `dt.tzinfo` access with `HeapEntries::get - data already freed`.
+tz_keepalive = datetime.timezone(datetime.timedelta(hours=5))
+dt_keepalive = datetime.datetime(2024, 1, 1, tzinfo=tz_keepalive)
+tz_keepalive = None  # only `dt_keepalive` keeps the timezone alive now
+
+# Force the cycle-detecting GC to run: a self-referential list flips
+# `may_have_cycles`, and crossing the GC_INTERVAL allocation threshold
+# (100_000 GC-tracked allocations) triggers a mark-and-sweep pass.
+gc_seed = []
+gc_seed.append(gc_seed)
+for _i in range(100_100):
+    _x = [_i]
+
+# After GC, the tzinfo must still be reachable through the datetime.
+assert str(dt_keepalive.tzinfo) == 'UTC+05:00', 'datetime tzinfo must survive GC'
+assert dt_keepalive.tzinfo == datetime.timezone(datetime.timedelta(hours=5)), (
+    'datetime tzinfo must round-trip equal after GC'
+)
