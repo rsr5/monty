@@ -50,6 +50,18 @@ pub(crate) struct DateTime {
     tzinfo_ref: Option<HeapId>,
 }
 
+impl DateTime {
+    /// Returns the retained `tzinfo` heap reference, if this datetime is timezone-aware.
+    ///
+    /// Used by GC traversal (`collect_child_ids`) and ref-count cascade
+    /// (`py_dec_ref_ids_for_data`) so that the timezone object stays alive as long
+    /// as the datetime references it. Without this, `gc.collect` cannot reach the
+    /// tzinfo and may sweep it while the datetime still points at the freed slot.
+    pub(crate) fn tzinfo_ref(&self) -> Option<HeapId> {
+        self.tzinfo_ref
+    }
+}
+
 impl Hash for DateTime {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Hash must be consistent with equality (py_eq).

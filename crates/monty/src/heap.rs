@@ -1471,6 +1471,15 @@ fn collect_child_ids(data: &HeapData, work_list: &mut Vec<HeapId>) {
                 }
             }
         }
+        HeapData::DateTime(dt) => {
+            // Aware datetimes retain a heap reference to the tzinfo object so that
+            // `dt.tzinfo is tz` identity is preserved across attribute lookups.
+            // GC must follow that reference, otherwise the timezone gets swept
+            // while the datetime still points at the freed slot.
+            if let Some(tz_id) = dt.tzinfo_ref() {
+                work_list.push(tz_id);
+            }
+        }
         // Leaf types with no heap references
         _ => {}
     }
@@ -1523,6 +1532,13 @@ fn py_dec_ref_ids_for_data(data: &mut HeapData, stack: &mut Vec<HeapId>) {
             // Decrement ref count for result values that are heap references
             for result in gather.results.iter_mut().flatten() {
                 result.py_dec_ref_ids(stack);
+            }
+        }
+        HeapData::DateTime(dt) => {
+            // Mirror `collect_child_ids`: when an aware datetime is freed we must
+            // also drop the retained tzinfo reference so its refcount is balanced.
+            if let Some(tz_id) = dt.tzinfo_ref() {
+                stack.push(tz_id);
             }
         }
         // other types have no nested heap references
