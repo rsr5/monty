@@ -1221,9 +1221,7 @@ impl<T: ResourceTracker> Heap<T> {
             reachable[idx] = true;
 
             // Add children to work list
-            if let Some(entry) = self.entries.get_mut(idx) {
-                collect_child_ids(entry.data.0.get_mut(), &mut work_list);
-            }
+            collect_child_ids(self.get(id), &mut work_list);
         }
 
         let mut released_child_refs = Vec::new();
