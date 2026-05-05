@@ -135,6 +135,9 @@ impl Task {
     /// * `id` - Unique task identifier
     /// * `coroutine_id` - Optional HeapId of the coroutine being executed
     /// * `gather_id` - Optional HeapId of the GatherFuture this task belongs to
+    /// * `gather_result_indices` - Slots in the gather's results this task fills
+    ///   (empty for non-gather tasks; multiple when the same coroutine appears
+    ///   more than once in the gather)
     pub fn new(
         id: TaskId,
         coroutine_id: Option<HeapId>,

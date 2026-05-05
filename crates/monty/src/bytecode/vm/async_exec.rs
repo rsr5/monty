@@ -611,6 +611,8 @@ impl<'h, T: ResourceTracker> VM<'h, T> {
                 panic!("task coroutine_id doesn't point to a Coroutine")
             };
             let state = coro.get(self.heap).state;
+            // Release the heap read before either branch: both `init_task_from_coroutine`
+            // and `handle_task_failure` need exclusive `&mut self` access to the heap.
             drop(coro);
             if state == CoroutineState::New {
                 self.init_task_from_coroutine(coro_id)?;
