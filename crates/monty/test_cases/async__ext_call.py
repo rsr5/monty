@@ -74,11 +74,6 @@ assert results == [6, 50], 'gather should work with coroutine with multiple exte
 
 
 # === Gather with the same external future passed twice ===
-# CPython's `arg_to_fut` deduplication treats both slots as the same future and
-# returns its resolved value at every duplicate position. In Monty this also
-# avoids a pre-existing hang where the second slot's `take_resolved` would
-# return `None` (the first slot consumed the value), the gather would register
-# the same future as still pending, and never resolve.
 f = async_call(7)
 results = await asyncio.gather(f, f)  # pyright: ignore
 assert results == [7, 7], f'duplicate external future dedup: {results}'

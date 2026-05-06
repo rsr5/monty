@@ -86,9 +86,6 @@ assert result == ['a', 'b'], f'gather with *tuple unpacking: {result}'
 
 
 # === gather with the same coroutine passed twice ===
-# Matches CPython's `arg_to_fut` deduplication in `asyncio.tasks.gather`:
-# duplicate args resolve to the same Task, so the body runs once and its
-# result is returned at every duplicate position.
 dup_runs = [0]
 
 
@@ -101,6 +98,7 @@ dup_coro = dup()
 result = await asyncio.gather(dup_coro, dup_coro)  # pyright: ignore
 assert result == [1, 1], f'expected [1, 1], got {result}'
 assert dup_runs[0] == 1, f'coroutine body should run once, ran {dup_runs[0]} times'
+
 
 # Three duplicates and a mix of duplicates with a unique coroutine.
 async def dup3():
@@ -125,9 +123,8 @@ b_coro = beta()
 result = await asyncio.gather(a_coro, b_coro, a_coro)  # pyright: ignore
 assert result == ['a', 'b', 'a'], f'mixed dedup: expected [a, b, a], got {result}'
 
+
 # === gather with an already-awaited coroutine raises RuntimeError ===
-# A coroutine in the Completed state cannot be re-driven, so awaiting it
-# inside gather must fail cleanly rather than panic during task init.
 async def already():
     return 1
 
