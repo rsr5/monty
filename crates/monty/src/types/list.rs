@@ -8,11 +8,11 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     defer_drop, defer_drop_mut,
-    exception_private::{ExcType, RunError, RunResult},
+    exception_private::{ExcType, RunError, RunResult, SimpleException},
     heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapItem, HeapRead, HeapReadOutput, HeapReader},
     intern::StaticStrings,
     resource::{ResourceError, ResourceTracker},
-    sorting::{apply_permutation, sort_indices},
+    sorting::sort_values,
     types::{
         Type,
         slice::{normalize_sequence_index, slice_collect_iterator},
@@ -698,6 +698,15 @@ fn list_count<'h>(
 }
 
 /// Performs an in-place sort on a list with optional key function and reverse flag.
+///
+/// To safely support user-supplied `key` callbacks (and rich-comparison `__lt__`
+/// methods) that may reentrantly mutate the same list, we follow CPython's
+/// strategy: the list's `items` vector is **detached** for the duration of the
+/// sort so the list looks empty to any reentrant code. All sort work is then
+/// performed on the detached buffer, which is always swapped back into the
+/// list afterwards. If the user mutated the live (empty) list during the
+/// sort, we additionally raise `ValueError: list modified during sort`,
+/// matching CPython exactly.
 fn do_list_sort<'h>(
     list: &mut HeapRead<'h, List>,
     args: ArgValues,
@@ -725,37 +734,28 @@ fn do_list_sort<'h>(
     };
     defer_drop!(key_fn, vm);
 
-    // 1. Compute key values if a key function was provided, otherwise we'll sort by the items themselves
-    let compare_values = if let Some(f) = key_fn {
-        let len = list.get(vm.heap).items.len();
-        let keys: Vec<Value> = Vec::with_capacity(len);
-        // Use a HeapGuard to ensure that if key function evaluation fails partway through,
-        // we clean up any keys that were successfully computed
-        let mut keys_guard = HeapGuard::new(keys, vm);
-        let (keys, vm) = keys_guard.as_parts_mut();
-        for i in 0..len {
-            let item = list.get(vm.heap).items[i].clone_with_heap(vm);
-            keys.push(vm.evaluate_function("sorted() key argument", f, ArgValues::One(item))?);
-        }
-        keys_guard.into_inner()
+    // Detach the list's items so reentrant access via the list's heap id sees
+    // an empty list. The detached buffer is always swapped back into the list
+    // when we're done.
+    let items = mem::take(&mut list.get_mut(vm.heap).items);
+    defer_drop_mut!(items, vm);
+
+    let sort_result = sort_values(items, key_fn.as_ref(), reverse, vm);
+
+    // Swap our (sorted) buffer back into the list. Whatever the user placed
+    // on the live empty list during the sort ends up in `items`; if
+    // it's not empty, the user mutated the list. The `contains_refs` flag
+    // survives `mem::take`, so it still describes the buffer being swapped
+    // back.
+    mem::swap(list.get_mut(vm.heap).as_vec_mut(), items);
+
+    // Surface any sort error first; otherwise the modification error (if any).
+    sort_result?;
+    if items.is_empty() {
+        Ok(())
     } else {
-        list.get(vm.heap)
-            .items
-            .iter()
-            .map(|item| item.clone_with_heap(vm.heap))
-            .collect()
-    };
-    defer_drop!(compare_values, vm);
-
-    // 2. Sort indices by comparing key values (or items themselves if no key)
-    let len = compare_values.len();
-    let mut indices: Vec<usize> = (0..len).collect();
-
-    sort_indices(&mut indices, compare_values, reverse, vm)?;
-
-    // 3. Rearrange items in-place according to the sorted permutation
-    apply_permutation(&mut list.get_mut(vm.heap).items, &mut indices);
-    Ok(())
+        Err(SimpleException::new_msg(ExcType::ValueError, "list modified during sort").into())
+    }
 }
 
 /// Writes a formatted sequence of values to a formatter.
